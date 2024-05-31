@@ -35,7 +35,9 @@ from transformers import AutoTokenizer, PretrainedConfig
 import mindspore as ms
 from mindspore import Tensor, nn, ops
 from mindspore.amp import StaticLossScaler
-from mindspore.dataset import GeneratorDataset, transforms, vision
+
+from mindone.torchdata import DataLoader, DistributedSampler, transforms
+from mindone.torchdata.transforms.functional import crop
 
 from mindone.diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline, UNet2DConditionModel
 from mindone.diffusers.optimization import get_scheduler
@@ -712,10 +714,10 @@ def main():
             )
 
     # Preprocessing the datasets.
-    train_resize = vision.Resize(args.resolution, interpolation=vision.Inter.BILINEAR)
-    train_crop = vision.CenterCrop(args.resolution) if args.center_crop else vision.RandomCrop(args.resolution)
-    train_flip = vision.RandomHorizontalFlip(prob=1.0)
-    train_transforms = transforms.Compose([vision.ToTensor(), vision.Normalize([0.5], [0.5], is_hwc=False)])
+    train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
+    train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
+    train_flip = transforms.RandomHorizontalFlip(p=1.0)
+    train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
@@ -735,18 +737,13 @@ def main():
                 x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
                 image = train_crop(image)
             else:
-                h, w = image.height, image.width
-                th, tw = args.resolution, args.resolution
-                if h < th or w < tw:
-                    raise ValueError(f"Required crop size {(th, tw)} is larger than input image size {(h, w)}")
-                y1 = np.random.randint(0, h - th + 1, size=(1,)).item()
-                x1 = np.random.randint(0, w - tw + 1, size=(1,)).item()
-                image = image.crop((x1, y1, x1 + tw, y1 + th))
+                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
+                image = crop(image, y1, x1, h, w)
             crop_top_left = (y1, x1)
             crop_top_lefts.append(crop_top_left)
             add_time_id = original_sizes[-1] + crop_top_lefts[-1] + (args.resolution, args.resolution)
             add_time_ids.append(add_time_id)
-            image = train_transforms(image)[0]
+            image = train_transforms(image)
             all_images.append(image)
 
         examples["original_sizes"] = original_sizes
@@ -792,31 +789,22 @@ def main():
     # del text_encoders, tokenizers, vae
     # gc.collect()
 
-    class UnravelDataset:
-        columns = ["model_input", "prompt_embeds", "pooled_prompt_embeds", "add_time_ids"]
+    def collate_fn(examples):
+        model_input = np.array([example["model_input"] for example in examples], dtype=np.float32)
+        prompt_embeds = np.array([example["prompt_embeds"] for example in examples], dtype=np.float32)
+        pooled_prompt_embeds = np.array([example["pooled_prompt_embeds"] for example in examples], dtype=np.float32)
+        add_time_ids = np.array([example["add_time_ids"] for example in examples], dtype=np.int32)
 
-        def __init__(self, data):
-            self.data = data
-
-        def __getitem__(self, idx):
-            idx = idx.item() if isinstance(idx, np.integer) else idx  # what the fuck?
-            example = self.data[idx]  # members are list
-            return tuple(np.array(example[column], dtype=np.float32) for column in self.columns)
-
-        def __len__(self):
-            return len(self.data)
+        return model_input, prompt_embeds, pooled_prompt_embeds, add_time_ids
 
     # DataLoaders creation:
-    train_dataloader = GeneratorDataset(
-        UnravelDataset(train_dataset),
-        column_names=UnravelDataset.columns,
-        shuffle=True,
-        num_parallel_workers=args.dataloader_num_workers,
-        num_shards=args.world_size,
-        shard_id=args.rank,
-    ).batch(
+    train_dataloader = DataLoader(
+        train_dataset,
+        shuffle=(not args.distributed),
+        sampler=DistributedSampler(dataset, args.world_size, args.rank) if args.distributed else None,
+        collate_fn=collate_fn,
         batch_size=args.train_batch_size,
-        num_parallel_workers=args.dataloader_num_workers,
+        num_workers=args.dataloader_num_workers,
     )
 
     # Scheduler and math around the number of training steps.
@@ -892,7 +880,7 @@ def main():
         )
     else:
         sink_process = None
-        maybe_compile(train_step, is_master(args), *[x.to(weight_dtype) for x in next(iter(train_dataloader))])
+        maybe_compile(train_step, is_master(args), *[Tensor(x, dtype=weight_dtype) for x in next(iter(train_dataloader))])
 
     # create pipeline for validation
     pipeline = StableDiffusionXLPipeline(
@@ -961,19 +949,20 @@ def main():
         disable=not is_master(args),
     )
 
-    train_dataloader_iter = train_dataloader.create_tuple_iterator(num_epochs=args.num_train_epochs - first_epoch)
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.set_train(True)
         train_loss = 0.0
+        if args.distributed:
+            train_dataloader.sampler.set_epoch(epoch)
         for step, batch in (
             ((_, None) for _ in range(len(train_dataloader)))  # dummy iterator
             if args.enable_mindspore_data_sink
-            else enumerate(train_dataloader_iter)
+            else enumerate(train_dataloader)
         ):
             if args.enable_mindspore_data_sink:
                 loss, model_pred = sink_process()
             else:
-                batch = [x.to(weight_dtype) for x in batch]
+                batch = [Tensor(x, weight_dtype) for x in batch]
                 loss, model_pred = train_step(*batch)
             train_loss += loss.numpy().item()
 
