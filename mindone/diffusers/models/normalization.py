@@ -59,10 +59,12 @@ class AdaLayerNormZero(nn.Cell):
         num_embeddings (`int`): The size of the embeddings dictionary.
     """
 
-    def __init__(self, embedding_dim: int, num_embeddings: int):
+    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None):
         super().__init__()
-
-        self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
+        if num_embeddings is not None:
+            self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
+        else:
+            self.emb = None
 
         self.silu = nn.SiLU()
         self.linear = nn.Dense(embedding_dim, 6 * embedding_dim, has_bias=True)
@@ -71,11 +73,14 @@ class AdaLayerNormZero(nn.Cell):
     def construct(
         self,
         x: ms.Tensor,
-        timestep: ms.Tensor,
-        class_labels: ms.Tensor,
-        hidden_dtype=None,
+        timestep: Optional[ms.Tensor] = None,
+        class_labels: Optional[ms.Tensor] = None,
+        hidden_dtype: Optional[ms.Type] = None,
+        emb: Optional[ms.Tensor] = None,
     ) -> Tuple[ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor]:
-        emb = self.linear(self.silu(self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)))
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, axis=1)
         x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
