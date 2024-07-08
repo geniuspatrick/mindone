@@ -91,7 +91,9 @@ plugins:
   - search
   - git-revision-date-localized:
       enable_creation_date: true
-  - git-authors
+  - git-committers:
+      repository: mindspore-lab/mindone
+      branch: master
   - mkdocstrings:
       default_handler: python
       handlers:

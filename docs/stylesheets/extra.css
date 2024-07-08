@@ -17,3 +17,7 @@
   --md-footer-bg-color:                hsla(0, 0%, 100%, 0.87);
   --md-footer-bg-color--dark:          hsla(0, 0%, 100%, 0.32);
 }
+
+.md-typeset h1 {
+  color: var(--md-default-fg-color);  /* override the default alpha in templates */
+}
